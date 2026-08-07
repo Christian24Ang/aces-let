@@ -58,13 +58,33 @@ Do not open `docs/index.html` directly because browser JavaScript modules requir
 
 ## 6. Firestore rules
 
-If the latest ACES LET learner/Admin Lite rules are already published, no additional database structure is required. The included `firestore.rules` is provided for comparison and backup.
+Publish the included `firestore.rules`, or keep the identical Cloud Progress Sync rules already published for ACES LET Android v0.9.7.
 
-## Security behavior
+The rules add private learner paths:
+
+```text
+users/{uid}
+users/{uid}/attempts/{attemptId}
+```
+
+Each signed-in learner can access only their own Profile and History. Attempts are append-only and cannot be deleted by learner clients.
+
+## Updating an existing GitHub Pages deployment
+
+When replacing v0.1.1 files, preserve your already configured:
+
+```text
+docs/firebase-config.js
+```
+
+Then replace the remaining site files, commit, and push. The updated service worker uses a new cache name so the new shell is installed after deployment.
+
+## Security and sync behavior
 
 - No Service-account JSON is included.
+- Firebase Authentication and Firestore Rules protect each learner's records by UID.
 - Firestore question content uses memory-only web cache.
-- The service worker caches the website interface and icon assets, not Firebase question responses.
+- The service worker caches the interface and icon assets, not Firebase question responses.
 - `firebase-config.js` is explicitly excluded from the app-shell cache.
-- History, Statistics, and Profile remain local to each Firebase UID and browser profile.
-- Website progress does not synchronize with Android or another browser/device.
+- Profile and History synchronize with ACES LET Android and other signed-in browsers.
+- Statistics are recalculated locally from synchronized History.

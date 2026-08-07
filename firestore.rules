@@ -6,6 +6,10 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
     function isAdmin() {
       return isSignedIn()
         && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
@@ -16,10 +20,77 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/quizzes/$(quizId)).data.published == true;
     }
 
+    function validProfile(data) {
+      return data.keys().hasOnly([
+          'fullName',
+          'university',
+          'updatedAtEpochMillis',
+          'serverUpdatedAt',
+          'schemaVersion'
+        ])
+        && data.fullName is string
+        && data.fullName.size() >= 2
+        && data.fullName.size() <= 100
+        && data.university is string
+        && data.university.size() >= 2
+        && data.university.size() <= 150
+        && data.updatedAtEpochMillis is int
+        && data.updatedAtEpochMillis > 0
+        && data.serverUpdatedAt is timestamp
+        && data.schemaVersion == 1;
+    }
+
+    function validAttempt(data, uid, attemptId) {
+      return data.keys().hasOnly([
+          'attemptId',
+          'ownerUid',
+          'quizId',
+          'quizTitle',
+          'mode',
+          'score',
+          'answeredCount',
+          'totalItems',
+          'incorrectCount',
+          'unansweredCount',
+          'startedAtEpochMillis',
+          'completedAtEpochMillis',
+          'quizVersion',
+          'schemaVersion'
+        ])
+        && data.attemptId == attemptId
+        && data.ownerUid == uid
+        && data.quizId is string
+        && data.quizId.size() > 0
+        && data.quizId.size() <= 200
+        && data.quizTitle is string
+        && data.quizTitle.size() > 0
+        && data.quizTitle.size() <= 250
+        && (data.mode == 'GAME' || data.mode == 'EXAM')
+        && data.score is int
+        && data.answeredCount is int
+        && data.totalItems is int
+        && data.incorrectCount is int
+        && data.unansweredCount is int
+        && data.totalItems > 0
+        && data.answeredCount >= 0
+        && data.answeredCount <= data.totalItems
+        && data.score >= 0
+        && data.score <= data.answeredCount
+        && data.incorrectCount == data.answeredCount - data.score
+        && data.unansweredCount == data.totalItems - data.answeredCount
+        && data.startedAtEpochMillis is int
+        && data.completedAtEpochMillis is int
+        && data.startedAtEpochMillis > 0
+        && data.completedAtEpochMillis >= data.startedAtEpochMillis
+        && data.quizVersion is int
+        && data.quizVersion >= 0
+        && data.schemaVersion == 1;
+    }
+
     // Each administrator can read only their own authorization document.
     // Create/edit administrator records from the Firebase Console or trusted desktop Admin Manager.
     match /admins/{uid} {
-      allow get: if isSignedIn() && request.auth.uid == uid;
+      allow get: if isOwner(uid);
       allow list, create, update, delete: if false;
     }
 
@@ -39,6 +110,26 @@ service cloud.firestore {
       match /questions/{questionId} {
         allow get, list: if isAdmin() || (isSignedIn() && parentQuizIsPublished(quizId));
         allow create, update, delete: if isAdmin();
+      }
+    }
+
+    // Private learner profile and cross-device attempt history.
+    match /users/{uid} {
+      allow get: if isOwner(uid);
+      allow list: if false;
+      allow create, update: if isOwner(uid) && validProfile(request.resource.data);
+      allow delete: if false;
+
+      match /attempts/{attemptId} {
+        allow get, list: if isOwner(uid);
+        allow create: if isOwner(uid) && validAttempt(request.resource.data, uid, attemptId);
+
+        // Completed attempts are append-only. An exact repeat of the same write is
+        // permitted so offline retries remain idempotent without allowing score edits.
+        allow update: if isOwner(uid)
+          && validAttempt(request.resource.data, uid, attemptId)
+          && request.resource.data == resource.data;
+        allow delete: if false;
       }
     }
 

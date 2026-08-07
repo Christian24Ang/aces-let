@@ -10,11 +10,14 @@ import {
 } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-auth.js";
 import {
   collection,
+  doc,
   getDocs,
   initializeFirestore,
   memoryLocalCache,
   onSnapshot,
   query,
+  serverTimestamp,
+  setDoc,
   where
 } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
 import { firebaseConfig } from "./firebase-config.js";
@@ -45,13 +48,33 @@ const state = {
   online: navigator.onLine,
   unsubFolders: null,
   unsubQuizzes: null,
+  unsubProfile: null,
+  unsubAttempts: null,
+  cloud: {
+    isInitialSync: false,
+    isSyncing: false,
+    profileReady: false,
+    attemptsReady: false,
+    profilePending: false,
+    pendingAttemptCount: 0,
+    lastSyncedAt: null,
+    errorMessage: ""
+  },
   installPrompt: null
 };
 
 const dbPromise = openLocalDatabase();
 
-window.addEventListener("online", () => { state.online = true; render(); });
-window.addEventListener("offline", () => { state.online = false; render(); });
+window.addEventListener("online", () => {
+  state.online = true;
+  retryCloudSync();
+  render();
+});
+window.addEventListener("offline", () => {
+  state.online = false;
+  updatePendingSyncCounts();
+  render();
+});
 window.addEventListener("beforeinstallprompt", (event) => {
   event.preventDefault();
   state.installPrompt = event;
@@ -89,14 +112,17 @@ async function bootstrap() {
       if (user) {
         await loadLocalUserData(user.uid);
         startCatalogListeners();
+        startCloudProgressSync();
         replaceRoute("home");
       } else {
         stopCatalogListeners();
+        stopCloudProgressSync();
         state.folders = [];
         state.quizzes = [];
         state.attempts = [];
         state.profile = { fullName: "", university: "" };
         state.profileDraft = { ...state.profile };
+        state.cloud = emptyCloudState();
         state.view = "signin";
         history.replaceState({ aces: true, view: "signin" }, "", "#signin");
       }
@@ -164,11 +190,297 @@ function sortByOrderThenName(a, b) {
   return a.order - b.order || (a.name || a.title || "").localeCompare(b.name || b.title || "");
 }
 
+function emptyCloudState() {
+  return {
+    isInitialSync: false,
+    isSyncing: false,
+    profileReady: false,
+    attemptsReady: false,
+    profilePending: false,
+    pendingAttemptCount: 0,
+    lastSyncedAt: null,
+    errorMessage: ""
+  };
+}
+
 async function loadLocalUserData(uid) {
-  const [attempts, profile] = await Promise.all([getAttempts(uid), getProfile(uid)]);
-  state.attempts = attempts.sort((a, b) => b.completedAt - a.completedAt);
+  const [rawAttempts, rawProfile] = await Promise.all([getAttempts(uid), getProfile(uid)]);
+  const attempts = rawAttempts.map((attempt) => normalizeAttempt(attempt, uid)).filter(Boolean);
+  const profile = normalizeProfile(rawProfile, uid);
+
+  await Promise.all(attempts.map((attempt) => saveAttempt(attempt, false)));
+  if (profile) await saveProfile(profile, false);
+
+  state.attempts = attempts.sort((a, b) => b.completedAtEpochMillis - a.completedAtEpochMillis);
   state.profile = profile || { fullName: "", university: "" };
-  state.profileDraft = { ...state.profile };
+  state.profileDraft = { fullName: state.profile.fullName || "", university: state.profile.university || "" };
+  await updatePendingSyncCounts();
+}
+
+function startCloudProgressSync() {
+  stopCloudProgressSync();
+  if (!state.user || !state.db) return;
+
+  const uid = state.user.uid;
+  state.cloud = { ...emptyCloudState(), isInitialSync: true };
+  const profileRef = doc(state.db, "users", uid);
+  const attemptsRef = collection(state.db, "users", uid, "attempts");
+
+  state.unsubProfile = onSnapshot(
+    profileRef,
+    { includeMetadataChanges: true },
+    async (snapshot) => {
+      state.cloud.profileReady = true;
+      if (!snapshot.exists() || snapshot.metadata.hasPendingWrites()) {
+        updateInitialCloudSyncState();
+        return;
+      }
+      const remote = profileFromCloud(snapshot.data(), uid);
+      if (remote) {
+        const local = normalizeProfile(await getProfile(uid), uid);
+        if (!local || local.cloudSyncState === "SYNCED" || remote.updatedAtEpochMillis >= local.updatedAtEpochMillis) {
+          const hasUnsavedDraft = state.profileDraft.fullName !== (state.profile.fullName || "")
+            || state.profileDraft.university !== (state.profile.university || "");
+          await saveProfile(remote, false);
+          state.profile = remote;
+          if (!hasUnsavedDraft) {
+            state.profileDraft = { fullName: remote.fullName, university: remote.university };
+          }
+          markCloudActivity();
+          renderIfMainView();
+        }
+      }
+      updateInitialCloudSyncState();
+    },
+    (error) => {
+      state.cloud.profileReady = true;
+      updateInitialCloudSyncState();
+      reportCloudSyncError("Profile could not be downloaded.", error);
+    }
+  );
+
+  state.unsubAttempts = onSnapshot(
+    attemptsRef,
+    { includeMetadataChanges: true },
+    async (snapshot) => {
+      state.cloud.attemptsReady = true;
+      const remoteAttempts = snapshot.docs
+        .filter((document) => !document.metadata.hasPendingWrites())
+        .map((document) => attemptFromCloud(document.id, document.data(), uid))
+        .filter(Boolean);
+      if (remoteAttempts.length) {
+        await Promise.all(remoteAttempts.map((attempt) => saveAttempt(attempt, false)));
+        for (const attempt of remoteAttempts) upsertStateAttempt(attempt);
+        markCloudActivity();
+        await updatePendingSyncCounts();
+        renderIfMainView();
+      }
+      updateInitialCloudSyncState();
+    },
+    (error) => {
+      state.cloud.attemptsReady = true;
+      updateInitialCloudSyncState();
+      reportCloudSyncError("History could not be downloaded.", error);
+    }
+  );
+
+  retryCloudSync();
+}
+
+function stopCloudProgressSync() {
+  if (state.unsubProfile) state.unsubProfile();
+  if (state.unsubAttempts) state.unsubAttempts();
+  state.unsubProfile = null;
+  state.unsubAttempts = null;
+}
+
+function updateInitialCloudSyncState() {
+  if (state.cloud.profileReady && state.cloud.attemptsReady) {
+    state.cloud.isInitialSync = false;
+    retryCloudSync();
+    renderIfMainView();
+  }
+}
+
+async function retryCloudSync() {
+  if (!state.user || !state.db || !state.online || state.cloud.isInitialSync || state.cloud.isSyncing) return;
+  state.cloud.isSyncing = true;
+  state.cloud.errorMessage = "";
+  renderIfMainView();
+  try {
+    const uid = state.user.uid;
+    const profile = normalizeProfile(await getProfile(uid), uid);
+    if (profile && profile.cloudSyncState !== "SYNCED" && validProfileForCloud(profile)) {
+      await uploadProfile(profile);
+    }
+
+    const attempts = (await getAttempts(uid)).map((attempt) => normalizeAttempt(attempt, uid)).filter(Boolean);
+    for (const attempt of attempts.filter((item) => item.cloudSyncState !== "SYNCED")) {
+      await uploadAttempt(attempt);
+    }
+    state.cloud.lastSyncedAt = Date.now();
+  } catch (error) {
+    reportCloudSyncError("Some changes are waiting to sync.", error);
+  } finally {
+    state.cloud.isSyncing = false;
+    await updatePendingSyncCounts();
+    renderIfMainView();
+  }
+}
+
+async function uploadProfile(profile) {
+  const uid = state.user.uid;
+  await setDoc(doc(state.db, "users", uid), {
+    fullName: profile.fullName,
+    university: profile.university,
+    updatedAtEpochMillis: profile.updatedAtEpochMillis,
+    serverUpdatedAt: serverTimestamp(),
+    schemaVersion: 1
+  });
+  const synced = { ...profile, cloudSyncState: "SYNCED", cloudSyncedAtEpochMillis: Date.now() };
+  await saveProfile(synced, false);
+  state.profile = synced;
+}
+
+async function uploadAttempt(attempt) {
+  const cloudData = attemptToCloud(attempt);
+  if (!cloudData) return;
+  await setDoc(doc(state.db, "users", state.user.uid, "attempts", attempt.attemptId), cloudData);
+  const synced = { ...attempt, cloudSyncState: "SYNCED", cloudSyncedAtEpochMillis: Date.now() };
+  await saveAttempt(synced, false);
+  upsertStateAttempt(synced);
+}
+
+function profileFromCloud(data, uid) {
+  if (!data || typeof data.fullName !== "string" || typeof data.university !== "string") return null;
+  const updatedAt = Number(data.updatedAtEpochMillis);
+  const fullName = data.fullName.trim();
+  const university = data.university.trim();
+  if (fullName.length < 2 || university.length < 2 || !Number.isSafeInteger(updatedAt) || updatedAt <= 0) return null;
+  return {
+    ownerUid: uid,
+    fullName,
+    university,
+    updatedAtEpochMillis: updatedAt,
+    cloudSyncState: "SYNCED",
+    cloudSyncedAtEpochMillis: Date.now()
+  };
+}
+
+function attemptFromCloud(attemptId, data, uid) {
+  if (!data || data.attemptId !== attemptId || data.ownerUid !== uid) return null;
+  return normalizeAttempt({ id: attemptId, ...data, cloudSyncState: "SYNCED", cloudSyncedAtEpochMillis: Date.now() }, uid);
+}
+
+function normalizeProfile(profile, uid) {
+  if (!profile) return null;
+  const fullName = stringField(profile.fullName);
+  const university = stringField(profile.university);
+  const updatedAtEpochMillis = Math.trunc(numberField(profile.updatedAtEpochMillis ?? profile.updatedAt, Date.now()));
+  if (!fullName && !university) return null;
+  return {
+    ownerUid: uid,
+    fullName,
+    university,
+    updatedAtEpochMillis,
+    cloudSyncState: profile.cloudSyncState === "SYNCED" ? "SYNCED" : "PENDING",
+    cloudSyncedAtEpochMillis: Number.isFinite(Number(profile.cloudSyncedAtEpochMillis)) ? Number(profile.cloudSyncedAtEpochMillis) : null
+  };
+}
+
+function normalizeAttempt(raw, uid) {
+  if (!raw) return null;
+  const attemptId = stringField(raw.attemptId || raw.id);
+  const quizId = stringField(raw.quizId);
+  const quizTitle = stringField(raw.quizTitle);
+  const mode = raw.mode === "GAME" || raw.mode === "EXAM" ? raw.mode : null;
+  const totalItems = Math.trunc(numberField(raw.totalItems, 0));
+  const completedAtEpochMillis = Math.trunc(numberField(raw.completedAtEpochMillis ?? raw.completedAt, 0));
+  if (!attemptId || !quizId || !quizTitle || !mode || totalItems <= 0 || completedAtEpochMillis <= 0) return null;
+  const legacyUnanswered = Math.trunc(numberField(raw.unansweredCount ?? raw.unanswered, 0));
+  const answeredCount = Math.max(0, Math.min(totalItems, Math.trunc(numberField(raw.answeredCount, totalItems - legacyUnanswered))));
+  const score = Math.max(0, Math.min(answeredCount, Math.trunc(numberField(raw.score, 0))));
+  const unansweredCount = totalItems - answeredCount;
+  const startedAtEpochMillis = Math.max(1, Math.min(completedAtEpochMillis, Math.trunc(numberField(raw.startedAtEpochMillis, completedAtEpochMillis))));
+  return {
+    id: attemptId,
+    attemptId,
+    ownerUid: uid,
+    quizId,
+    quizTitle,
+    mode,
+    score,
+    answeredCount,
+    totalItems,
+    incorrectCount: answeredCount - score,
+    unansweredCount,
+    startedAtEpochMillis,
+    completedAtEpochMillis,
+    quizVersion: Math.max(0, Math.trunc(numberField(raw.quizVersion, 0))),
+    schemaVersion: 1,
+    percentage: percent(score, totalItems),
+    cloudSyncState: raw.cloudSyncState === "SYNCED" ? "SYNCED" : "PENDING",
+    cloudSyncedAtEpochMillis: Number.isFinite(Number(raw.cloudSyncedAtEpochMillis)) ? Number(raw.cloudSyncedAtEpochMillis) : null
+  };
+}
+
+function validProfileForCloud(profile) {
+  return profile.fullName.length >= 2 && profile.fullName.length <= 100
+    && profile.university.length >= 2 && profile.university.length <= 150
+    && Number.isSafeInteger(profile.updatedAtEpochMillis) && profile.updatedAtEpochMillis > 0;
+}
+
+function attemptToCloud(attempt) {
+  const normalized = normalizeAttempt(attempt, state.user.uid);
+  if (!normalized) return null;
+  return {
+    attemptId: normalized.attemptId,
+    ownerUid: normalized.ownerUid,
+    quizId: normalized.quizId,
+    quizTitle: normalized.quizTitle,
+    mode: normalized.mode,
+    score: normalized.score,
+    answeredCount: normalized.answeredCount,
+    totalItems: normalized.totalItems,
+    incorrectCount: normalized.incorrectCount,
+    unansweredCount: normalized.unansweredCount,
+    startedAtEpochMillis: normalized.startedAtEpochMillis,
+    completedAtEpochMillis: normalized.completedAtEpochMillis,
+    quizVersion: normalized.quizVersion,
+    schemaVersion: 1
+  };
+}
+
+function upsertStateAttempt(attempt) {
+  const index = state.attempts.findIndex((item) => item.attemptId === attempt.attemptId);
+  if (index >= 0) state.attempts[index] = attempt;
+  else state.attempts.push(attempt);
+  state.attempts.sort((a, b) => b.completedAtEpochMillis - a.completedAtEpochMillis);
+}
+
+async function updatePendingSyncCounts() {
+  if (!state.user) return;
+  const uid = state.user.uid;
+  const [attempts, profile] = await Promise.all([getAttempts(uid), getProfile(uid)]);
+  state.cloud.pendingAttemptCount = attempts.map((item) => normalizeAttempt(item, uid)).filter((item) => item && item.cloudSyncState !== "SYNCED").length;
+  const normalizedProfile = normalizeProfile(profile, uid);
+  state.cloud.profilePending = Boolean(normalizedProfile && normalizedProfile.cloudSyncState !== "SYNCED");
+}
+
+function markCloudActivity() {
+  state.cloud.lastSyncedAt = Date.now();
+  state.cloud.errorMessage = "";
+}
+
+function reportCloudSyncError(message, error) {
+  console.warn("ACES LET cloud sync:", error);
+  state.cloud.isInitialSync = false;
+  state.cloud.errorMessage = state.online ? message : "";
+  renderIfMainView();
+}
+
+function renderIfMainView() {
+  if (["home", "history", "stats", "profile"].includes(state.view)) render();
 }
 
 function render() {
@@ -193,8 +505,8 @@ function render() {
   };
   const subtitleMap = {
     home: state.selectedFolderId ? `${folderQuizzes().length} quizzes and mock exams` : "Practice. Assess. Improve.",
-    history: "Your completed attempts on this browser",
-    stats: "Your local performance overview",
+    history: "Your completed attempts across devices",
+    stats: "Performance calculated from your synced History",
     profile: "Your learner information and account"
   };
 
@@ -202,7 +514,7 @@ function render() {
     <div class="shell">
       ${appHeader(titleMap[state.view], subtitleMap[state.view], Boolean(state.selectedFolderId), state.selectedFolderId ? "back-folder" : "")}
       <section class="page">
-        ${!state.online ? `<div class="notice warning"><strong>Offline.</strong> Connect to the internet to open quizzes and refresh the quiz list. Your saved History, Statistics, and Profile remain available on this browser.</div>` : ""}
+        ${!state.online ? `<div class="notice warning"><strong>Offline.</strong> Connect to the internet to open quizzes and refresh the quiz list. Your saved Profile and History remain available and will sync when you reconnect.</div>` : ""}
         ${state.catalogError && state.view === "home" ? `<div class="notice error">${escapeHtml(state.catalogError)}</div>` : ""}
         <div id="page-content"></div>
       </section>
@@ -340,7 +652,7 @@ function historyView() {
   if (!state.attempts.length) return emptyState("↺", "No attempts yet", "Completed Game Mode and Exam Mode attempts will appear here.");
   return `<div class="list">${state.attempts.map((attempt) => `<div class="list-row">
     <span class="icon-tile">${attempt.mode === "GAME" ? "▶" : "▤"}</span>
-    <span class="row-copy"><span class="row-title">${escapeHtml(attempt.quizTitle)}</span><span class="row-subtitle">${attempt.mode === "GAME" ? "Game Mode" : "Exam Mode"} • ${attempt.score}/${attempt.totalItems}</span><span class="row-meta">${formatDateTime(attempt.completedAt)}</span></span>
+    <span class="row-copy"><span class="row-title">${escapeHtml(attempt.quizTitle)}</span><span class="row-subtitle">${attempt.mode === "GAME" ? "Game Mode" : "Exam Mode"} • ${attempt.score}/${attempt.totalItems}</span><span class="row-meta">${formatDateTime(attempt.completedAtEpochMillis)}</span></span>
     <span class="history-score"><strong>${attempt.percentage}%</strong><span>${attempt.score}/${attempt.totalItems}</span></span>
   </div>`).join("")}</div>`;
 }
@@ -349,7 +661,7 @@ function statsView() {
   if (!state.attempts.length) return emptyState("▥", "No statistics yet", "Complete a quiz or mock exam to begin tracking your performance.");
   const stats = computeStats(state.attempts);
   return `
-    <div class="summary-hero"><div class="summary-label">Overall Accuracy</div><div class="summary-number">${stats.overall}%</div><div class="summary-caption">${stats.totalAttempts} attempts • ${stats.totalQuestions} questions</div></div>
+    <div class="summary-hero"><div class="summary-label">Overall Accuracy</div><div class="summary-number">${stats.overall}%</div><div class="summary-caption">${stats.totalAttempts} attempts • ${stats.totalQuestions} questions answered</div></div>
     <div class="metric-grid">
       <div class="metric"><div class="metric-value">${stats.average}%</div><div class="metric-label">Average</div></div>
       <div class="metric"><div class="metric-value">${stats.best}%</div><div class="metric-label">Best</div></div>
@@ -370,19 +682,38 @@ function modeStatsRow(label, mode, gold) {
 
 function profileView() {
   const initials = getInitials(state.profileDraft.fullName || state.user.email || "A");
+  const sync = cloudSyncPresentation();
   return `
     <div class="profile-hero"><div class="avatar">${escapeHtml(initials)}</div><div><h2>${escapeHtml(state.profile.fullName || "ACES LET Learner")}</h2><p>${escapeHtml(state.profile.university || state.user.email || "")}</p></div></div>
     <form class="profile-form" id="profile-form">
-      <div class="field"><label for="profile-name">Full Name</label><input id="profile-name" maxlength="80" value="${escapeAttr(state.profileDraft.fullName)}" /></div>
-      <div class="field"><label for="profile-university">University or School</label><input id="profile-university" maxlength="120" value="${escapeAttr(state.profileDraft.university)}" /></div>
+      <div class="field"><label for="profile-name">Full Name</label><input id="profile-name" maxlength="100" value="${escapeAttr(state.profileDraft.fullName)}" /></div>
+      <div class="field"><label for="profile-university">University or School</label><input id="profile-university" maxlength="150" value="${escapeAttr(state.profileDraft.university)}" /></div>
       <div class="error-text" id="profile-error"></div>
       <button class="primary-button full-button" type="submit">Save Changes</button>
     </form>
     <h2 class="section-title" style="padding:18px 18px 0">Account</h2>
+    <div class="account-row"><span class="icon-tile">☁</span><span class="row-copy"><span class="row-title">Cloud Sync</span><span class="row-subtitle">${escapeHtml(sync.message)}</span></span>${sync.showRetry ? `<button class="secondary-button account-action" id="sync-retry">Retry</button>` : ""}</div>
     <div class="account-row"><span class="icon-tile">@</span><span class="row-copy"><span class="row-title">Signed-in email</span><span class="row-subtitle">${escapeHtml(state.user.email || "")}</span></span></div>
     <div class="account-row"><span class="icon-tile">↗</span><span class="row-copy"><span class="row-title">Reset Password</span><span class="row-subtitle">Send a password-reset link to your email.</span></span><button class="secondary-button account-action" id="profile-reset">Send Link</button></div>
     ${state.installPrompt ? `<div class="account-row"><span class="icon-tile">⇩</span><span class="row-copy"><span class="row-title">Install ACES LET</span><span class="row-subtitle">Add the web app to this device.</span></span><button class="secondary-button account-action" id="install-app">Install</button></div>` : ""}
-    <div class="account-row"><span class="icon-tile">⇥</span><span class="row-copy"><span class="row-title">Sign Out</span><span class="row-subtitle">Your local History and Profile stay on this browser.</span></span><button class="danger-button account-action" id="signout-button">Sign Out</button></div>`;
+    <div class="account-row"><span class="icon-tile">⇥</span><span class="row-copy"><span class="row-title">Sign Out</span><span class="row-subtitle">Your Profile and History are linked to this account.</span></span><button class="danger-button account-action" id="signout-button">Sign Out</button></div>`;
+}
+
+function cloudSyncPresentation() {
+  if (state.cloud.isInitialSync) return { message: "Checking your Profile and History…", showRetry: false };
+  if (!state.online && (state.cloud.profilePending || state.cloud.pendingAttemptCount > 0)) {
+    return { message: "Waiting to sync when you are online.", showRetry: false };
+  }
+  if (state.cloud.isSyncing) return { message: "Syncing your Profile and History…", showRetry: false };
+  if (state.cloud.errorMessage) return { message: state.cloud.errorMessage, showRetry: state.online };
+  if (state.cloud.profilePending && !validProfileForCloud(state.profile)) {
+    return { message: "Complete your Full Name and University or School to enable Profile sync.", showRetry: false };
+  }
+  if (state.cloud.profilePending || state.cloud.pendingAttemptCount > 0) {
+    return { message: "Some changes are waiting to sync.", showRetry: state.online };
+  }
+  if (state.cloud.lastSyncedAt) return { message: `Up to date • ${formatDateTime(state.cloud.lastSyncedAt)}`, showRetry: false };
+  return { message: "Your Profile and History sync across devices.", showRetry: false };
 }
 
 function wireMainViewEvents() {
@@ -409,16 +740,30 @@ function wireMainViewEvents() {
       event.preventDefault();
       const fullName = state.profileDraft.fullName.trim().replace(/\s+/g, " ");
       const university = state.profileDraft.university.trim().replace(/\s+/g, " ");
-      if (!fullName) {
+      if (fullName.length < 2) {
         document.querySelector("#profile-error").textContent = "Enter your full name.";
         return;
       }
-      state.profile = { fullName, university };
-      state.profileDraft = { ...state.profile };
-      await saveProfile({ ownerUid: state.user.uid, ...state.profile, updatedAt: Date.now() });
-      toast("Profile saved.");
+      if (university.length < 2) {
+        document.querySelector("#profile-error").textContent = "Enter your university or school.";
+        return;
+      }
+      const updatedAtEpochMillis = Date.now();
+      state.profile = {
+        ownerUid: state.user.uid,
+        fullName,
+        university,
+        updatedAtEpochMillis,
+        cloudSyncState: "PENDING",
+        cloudSyncedAtEpochMillis: null
+      };
+      state.profileDraft = { fullName, university };
+      await saveProfile(state.profile);
+      await updatePendingSyncCounts();
+      toast(state.online ? "Profile saved and syncing." : "Profile saved. It will sync when you reconnect.");
       render();
     });
+    document.querySelector("#sync-retry")?.addEventListener("click", retryCloudSync);
     document.querySelector("#profile-reset")?.addEventListener("click", () => openResetPasswordModal(state.user.email || "", true));
     document.querySelector("#signout-button")?.addEventListener("click", () => openConfirmModal("Sign Out?", "You can sign in again using your ACES LET account.", "Sign Out", async () => signOut(state.auth)));
     document.querySelector("#install-app")?.addEventListener("click", async () => {
@@ -446,10 +791,10 @@ async function startMode(quizId, mode) {
   try {
     const questions = await fetchQuestions(quiz);
     if (mode === "GAME") {
-      state.game = { quiz, questions, index: 0, selected: null, submitted: false, answers: [], saved: false };
+      state.game = { quiz, questions, index: 0, selected: null, submitted: false, answers: [], saved: false, startedAtEpochMillis: Date.now() };
       state.view = "game";
     } else {
-      state.exam = { quiz, questions, index: 0, answers: {}, flags: new Set(), saved: false, reviewIndex: 0 };
+      state.exam = { quiz, questions, index: 0, answers: {}, flags: new Set(), saved: false, reviewIndex: 0, startedAtEpochMillis: Date.now() };
       state.view = "exam";
     }
     state.loadingMessage = "";
@@ -553,9 +898,9 @@ async function saveCompletedGame() {
   const game = state.game;
   if (!game || game.saved) return;
   const score = game.answers.filter((answer) => answer.isCorrect).length;
-  const attempt = buildAttempt(game.quiz, "GAME", score, game.questions.length, 0);
+  const attempt = buildAttempt(game.quiz, "GAME", score, game.questions.length, 0, game.startedAtEpochMillis);
   await saveAttempt(attempt);
-  state.attempts.unshift(attempt);
+  upsertStateAttempt(attempt);
   game.saved = true;
 }
 
@@ -568,7 +913,7 @@ function renderGameResults() {
   document.querySelector("#results-back").addEventListener("click", returnToFolder);
   document.querySelector("#game-done").addEventListener("click", returnToFolder);
   document.querySelector("#game-again").addEventListener("click", () => {
-    state.game = { quiz: game.quiz, questions: game.questions, index: 0, selected: null, submitted: false, answers: [], saved: false };
+    state.game = { quiz: game.quiz, questions: game.questions, index: 0, selected: null, submitted: false, answers: [], saved: false, startedAtEpochMillis: Date.now() };
     state.view = "game";
     replaceRoute("game");
     render();
@@ -633,9 +978,9 @@ async function completeExam() {
   const score = exam.questions.filter((question) => exam.answers[question.id] === question.correctAnswer).length;
   const unanswered = exam.questions.filter((question) => !exam.answers[question.id]).length;
   if (!exam.saved) {
-    const attempt = buildAttempt(exam.quiz, "EXAM", score, exam.questions.length, unanswered);
+    const attempt = buildAttempt(exam.quiz, "EXAM", score, exam.questions.length, unanswered, exam.startedAtEpochMillis);
     await saveAttempt(attempt);
-    state.attempts.unshift(attempt);
+    upsertStateAttempt(attempt);
     exam.saved = true;
   }
   state.view = "examResults";
@@ -654,7 +999,7 @@ function renderExamResults() {
   document.querySelector("#exam-done").addEventListener("click", returnToFolder);
   document.querySelector("#review-answers").addEventListener("click", () => { exam.reviewIndex = 0; state.view = "examReview"; pushRoute("examReview"); render(); });
   document.querySelector("#exam-retake").addEventListener("click", () => {
-    state.exam = { quiz: exam.quiz, questions: exam.questions, index: 0, answers: {}, flags: new Set(), saved: false, reviewIndex: 0 };
+    state.exam = { quiz: exam.quiz, questions: exam.questions, index: 0, answers: {}, flags: new Set(), saved: false, reviewIndex: 0, startedAtEpochMillis: Date.now() };
     state.view = "exam";
     replaceRoute("exam");
     render();
@@ -744,18 +1089,40 @@ function choiceEntries(question) { return [["A", question.choiceA], ["B", questi
 function stringField(value) { return typeof value === "string" ? value.trim() : ""; }
 function numberField(value, fallback) { return Number.isFinite(Number(value)) ? Number(value) : fallback; }
 function percent(score, total) { return total ? Math.round((score / total) * 100) : 0; }
-function buildAttempt(quiz, mode, score, totalItems, unanswered) {
-  return { id: crypto.randomUUID(), ownerUid: state.user.uid, quizId: quiz.id, quizTitle: quiz.title, mode, score, totalItems, unanswered, percentage: percent(score, totalItems), completedAt: Date.now() };
+function buildAttempt(quiz, mode, score, totalItems, unansweredCount, startedAtEpochMillis) {
+  const attemptId = crypto.randomUUID();
+  const answeredCount = Math.max(0, totalItems - unansweredCount);
+  const completedAtEpochMillis = Date.now();
+  return {
+    id: attemptId,
+    attemptId,
+    ownerUid: state.user.uid,
+    quizId: quiz.id,
+    quizTitle: quiz.title,
+    mode,
+    score,
+    answeredCount,
+    totalItems,
+    incorrectCount: answeredCount - score,
+    unansweredCount,
+    startedAtEpochMillis: Math.min(startedAtEpochMillis || completedAtEpochMillis, completedAtEpochMillis),
+    completedAtEpochMillis,
+    quizVersion: quiz.version || 0,
+    schemaVersion: 1,
+    percentage: percent(score, totalItems),
+    cloudSyncState: "PENDING",
+    cloudSyncedAtEpochMillis: null
+  };
 }
 
 function computeStats(attempts) {
-  const sortedAsc = [...attempts].sort((a, b) => a.completedAt - b.completedAt);
-  const totalQuestions = attempts.reduce((sum, item) => sum + item.totalItems, 0);
+  const sortedAsc = [...attempts].sort((a, b) => a.completedAtEpochMillis - b.completedAtEpochMillis);
+  const totalQuestions = attempts.reduce((sum, item) => sum + item.answeredCount, 0);
   const totalCorrect = attempts.reduce((sum, item) => sum + item.score, 0);
   const percentages = attempts.map((item) => item.percentage);
   const mode = (name) => {
     const items = attempts.filter((item) => item.mode === name);
-    const questions = items.reduce((sum, item) => sum + item.totalItems, 0);
+    const questions = items.reduce((sum, item) => sum + item.answeredCount, 0);
     const correct = items.reduce((sum, item) => sum + item.score, 0);
     return { count: items.length, accuracy: percent(correct, questions) };
   };
@@ -766,8 +1133,8 @@ function computeStats(attempts) {
     groups.get(key).push(attempt);
   }
   const byQuiz = [...groups.entries()].map(([quizId, items]) => {
-    const ordered = [...items].sort((a, b) => b.completedAt - a.completedAt);
-    const total = items.reduce((sum, item) => sum + item.totalItems, 0);
+    const ordered = [...items].sort((a, b) => b.completedAtEpochMillis - a.completedAtEpochMillis);
+    const total = items.reduce((sum, item) => sum + item.answeredCount, 0);
     const correct = items.reduce((sum, item) => sum + item.score, 0);
     return {
       quizId,
@@ -858,7 +1225,7 @@ function escapeAttr(value) { return escapeHtml(value).replace(/`/g, "&#96;"); }
 
 function openLocalDatabase() {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open("aces-let-web", 1);
+    const request = indexedDB.open("aces-let-web", 2);
     request.onupgradeneeded = () => {
       const database = request.result;
       if (!database.objectStoreNames.contains("attempts")) {
@@ -872,9 +1239,11 @@ function openLocalDatabase() {
   });
 }
 
-async function saveAttempt(attempt) {
+async function saveAttempt(attempt, triggerSync = true) {
   const database = await dbPromise;
-  return transactionPromise(database, "attempts", "readwrite", (store) => store.put(attempt));
+  const result = await transactionPromise(database, "attempts", "readwrite", (store) => store.put(attempt));
+  if (triggerSync) retryCloudSync();
+  return result;
 }
 async function getAttempts(uid) {
   const database = await dbPromise;
@@ -885,9 +1254,11 @@ async function getAttempts(uid) {
     request.onerror = () => reject(request.error);
   });
 }
-async function saveProfile(profile) {
+async function saveProfile(profile, triggerSync = true) {
   const database = await dbPromise;
-  return transactionPromise(database, "profiles", "readwrite", (store) => store.put(profile));
+  const result = await transactionPromise(database, "profiles", "readwrite", (store) => store.put(profile));
+  if (triggerSync) retryCloudSync();
+  return result;
 }
 async function getProfile(uid) {
   const database = await dbPromise;

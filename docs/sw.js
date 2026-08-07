@@ -1,4 +1,4 @@
-const CACHE_NAME = "aces-let-web-shell-v0.1.1";
+const CACHE_NAME = "aces-let-web-shell-v0.2.0";
 const APP_BASE_URL = new URL("./", self.location.href);
 const INDEX_URL = new URL("./index.html", APP_BASE_URL).href;
 const FIREBASE_CONFIG_URL = new URL("./firebase-config.js", APP_BASE_URL).href;
