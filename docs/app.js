@@ -653,7 +653,7 @@ function historyView() {
   return `<div class="list">${state.attempts.map((attempt) => `<div class="list-row">
     <span class="icon-tile">${attempt.mode === "GAME" ? "▶" : "▤"}</span>
     <span class="row-copy"><span class="row-title">${escapeHtml(attempt.quizTitle)}</span><span class="row-subtitle">${attempt.mode === "GAME" ? "Game Mode" : "Exam Mode"} • ${attempt.score}/${attempt.totalItems}</span><span class="row-meta">${formatDateTime(attempt.completedAtEpochMillis)}</span></span>
-    <span class="history-score"><strong>${attempt.percentage}%</strong><span>${attempt.score}/${attempt.totalItems}</span></span>
+    <span class="history-score"><strong>${attempt.percentage}%</strong></span>
   </div>`).join("")}</div>`;
 }
 
@@ -718,10 +718,11 @@ function cloudSyncPresentation() {
 
 function wireMainViewEvents() {
   document.querySelectorAll("[data-nav]").forEach((button) => button.addEventListener("click", () => navigateMain(button.dataset.nav)));
-  document.querySelector("#back-folder")?.addEventListener("click", () => { state.selectedFolderId = null; replaceRoute("home"); render(); });
+  document.querySelector("#back-folder")?.addEventListener("click", () => { state.selectedFolderId = null; replaceRoute("home"); window.scrollTo({ top: 0, left: 0, behavior: "auto" }); render(); });
   document.querySelectorAll("[data-folder-id]").forEach((button) => button.addEventListener("click", () => {
     state.selectedFolderId = button.dataset.folderId;
     pushRoute("home");
+    window.scrollTo({ top: 0, left: 0, behavior: "auto" });
     render();
   }));
   document.querySelectorAll("[data-start-game]").forEach((button) => button.addEventListener("click", () => startMode(button.dataset.startGame, "GAME")));
@@ -780,6 +781,7 @@ function navigateMain(view) {
   if (view === "home") state.selectedFolderId = null;
   state.view = view;
   pushRoute(view);
+  window.scrollTo({ top: 0, left: 0, behavior: "auto" });
   render();
 }
 
