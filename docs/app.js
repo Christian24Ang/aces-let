@@ -231,7 +231,7 @@ function startCloudProgressSync() {
     { includeMetadataChanges: true },
     async (snapshot) => {
       state.cloud.profileReady = true;
-      if (!snapshot.exists() || snapshot.metadata.hasPendingWrites()) {
+      if (!snapshot.exists() || snapshot.metadata.hasPendingWrites) {
         updateInitialCloudSyncState();
         return;
       }
@@ -265,7 +265,7 @@ function startCloudProgressSync() {
     async (snapshot) => {
       state.cloud.attemptsReady = true;
       const remoteAttempts = snapshot.docs
-        .filter((document) => !document.metadata.hasPendingWrites())
+        .filter((document) => !document.metadata.hasPendingWrites)
         .map((document) => attemptFromCloud(document.id, document.data(), uid))
         .filter(Boolean);
       if (remoteAttempts.length) {
