@@ -1,7 +1,7 @@
 // Register a Web app in the same ACES LET Firebase project, then replace
 // the placeholder values below with the exact configuration Firebase provides.
 
-  const firebaseConfig = {
+export const firebaseConfig = {
     apiKey: "AIzaSyCJeiAcr8T_suxlnH2Ndmay7qz1B1uXmX4",
     authDomain: "aces-let.firebaseapp.com",
     projectId: "aces-let",
